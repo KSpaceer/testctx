@@ -10,7 +10,7 @@ import (
 
 func TestAnalyzer(t *testing.T) {
 	testdata := analysistest.TestData()
-	analysistest.Run(t, testdata, testctx.Analyzer, "test")
+	analysistest.RunWithSuggestedFixes(t, testdata, testctx.Analyzer, "test")
 }
 
 func TestContainerSuggestedFixes(t *testing.T) {
