@@ -366,8 +366,8 @@ func findDeepestEnclosingFunc(fn *ssa.Function, pos token.Pos) *ssa.Function {
 // ordinary callers. Merely creating a nested closure does not call it.
 func functionsCalledDuringCleanup(result *buildssa.SSA) map[*ssa.Function]bool {
 	bindings := closureBindings(result)
-	callees := make(map[*ssa.Function][]*ssa.Function)
 	var queue []*ssa.Function
+
 	for _, fn := range result.SrcFuncs {
 		for _, block := range fn.Blocks {
 			for _, instr := range block.Instrs {
@@ -376,7 +376,6 @@ func functionsCalledDuringCleanup(result *buildssa.SSA) map[*ssa.Function]bool {
 					continue
 				}
 				common := call.Common()
-				callees[fn] = append(callees[fn], functionTargets(common.Value, bindings)...)
 				if isCleanupCall(common) {
 					callback := common.Args[len(common.Args)-1]
 					queue = append(queue, functionTargets(callback, bindings)...)
@@ -393,8 +392,18 @@ func functionsCalledDuringCleanup(result *buildssa.SSA) map[*ssa.Function]bool {
 			continue
 		}
 		reachable[fn] = true
-		queue = append(queue, callees[fn]...)
+
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				call, ok := instr.(ssa.CallInstruction)
+				if !ok {
+					continue
+				}
+				queue = append(queue, functionTargets(call.Common().Value, bindings)...)
+			}
+		}
 	}
+
 	return reachable
 }
 
