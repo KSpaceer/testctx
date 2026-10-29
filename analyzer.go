@@ -2,10 +2,13 @@ package testctx
 
 import (
 	"bytes"
+	"cmp"
 	"go/ast"
 	"go/format"
 	"go/token"
 	"go/types"
+	"slices"
+	"strconv"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
@@ -33,6 +36,8 @@ func run(pass *analysis.Pass) (any, error) {
 	cleanupFunctions := functionsCalledDuringCleanup(ssaResult)
 
 	astFilter := []ast.Node{(*ast.CallExpr)(nil)}
+
+	var diagnostics []analysis.Diagnostic
 
 	inspectResult.Preorder(astFilter, func(node ast.Node) {
 		callExpr, ok := node.(*ast.CallExpr)
@@ -90,7 +95,7 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		pass.Report(analysis.Diagnostic{
+		diagnostics = append(diagnostics, analysis.Diagnostic{
 			Pos:      callExpr.Pos(),
 			End:      callExpr.End(),
 			Category: "context",
@@ -109,12 +114,19 @@ func run(pass *analysis.Pass) (any, error) {
 		})
 	})
 
+	diagnostics = applyImportFixes(pass, diagnostics)
+	for i := range diagnostics {
+		pass.Report(diagnostics[i])
+	}
+
 	return nil, nil
 }
 
+const contextPackagePath = "context"
+
 var basicContextFunctions = [...][2]string{
-	{"context", "Background"},
-	{"context", "TODO"},
+	{contextPackagePath, "Background"},
+	{contextPackagePath, "TODO"},
 }
 
 func isBasicContextFunction(fn *types.Func) bool {
@@ -448,4 +460,145 @@ func isCleanupCall(common *ssa.CallCommon) bool {
 	}
 	return method != nil && method.Name() == testingCleanupMethod &&
 		method.Pkg() != nil && method.Pkg().Path() == testingPackagePath
+}
+
+func applyImportFixes(pass *analysis.Pass, diagnostics []analysis.Diagnostic) []analysis.Diagnostic {
+	for _, file := range pass.Files {
+		var replacements []analysis.TextEdit
+
+		firstDiagnosticIdx := -1
+
+		for i, diagnostic := range diagnostics {
+			if diagnostic.Pos < file.Pos() || diagnostic.Pos >= file.End() {
+				continue
+			}
+			if firstDiagnosticIdx == -1 {
+				firstDiagnosticIdx = i
+			}
+			replacements = append(replacements, diagnostic.SuggestedFixes[0].TextEdits...)
+			diagnostics[i].SuggestedFixes = nil
+		}
+
+		if firstDiagnosticIdx == -1 {
+			continue
+		}
+
+		edits := slices.Clone(replacements)
+		edits = append(edits, unusedContextImportEdits(pass, file, replacements)...)
+
+		slices.SortFunc(edits, func(a, b analysis.TextEdit) int {
+			return cmp.Compare(a.Pos, b.Pos)
+		})
+
+		diagnostics[firstDiagnosticIdx].SuggestedFixes = []analysis.SuggestedFix{
+			{
+				Message:   "use testing context in this file",
+				TextEdits: edits,
+			},
+		}
+	}
+	return diagnostics
+}
+
+func unusedContextImportEdits(
+	pass *analysis.Pass,
+	file *ast.File,
+	replacements []analysis.TextEdit,
+) []analysis.TextEdit {
+	removable := make(map[*ast.ImportSpec]bool)
+
+	for _, spec := range file.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || path != contextPackagePath {
+			continue
+		}
+
+		var obj types.Object
+		if spec.Name == nil {
+			obj = pass.TypesInfo.Implicits[spec]
+		} else {
+			obj = pass.TypesInfo.Defs[spec.Name]
+		}
+
+		pkgName, ok := obj.(*types.PkgName)
+		if !ok || pkgName.Name() == "_" {
+			continue
+		}
+
+		if !importUsedAfterReplacements(pass, file, pkgName, replacements) {
+			removable[spec] = true
+		}
+	}
+
+	var edits []analysis.TextEdit
+	for _, decl := range file.Decls {
+		imports, ok := decl.(*ast.GenDecl)
+		if !ok || imports.Tok != token.IMPORT {
+			continue
+		}
+
+		var specsToRemove []*ast.ImportSpec
+		for _, spec := range imports.Specs {
+			importSpec := spec.(*ast.ImportSpec)
+			if removable[importSpec] {
+				specsToRemove = append(specsToRemove, importSpec)
+			}
+		}
+
+		if len(specsToRemove) == 0 {
+			continue
+		}
+
+		if len(specsToRemove) == len(imports.Specs) {
+			// removing entire import declaration to avoid an empty import
+			edits = append(edits, analysis.TextEdit{
+				Pos: imports.Pos(),
+				End: imports.End(),
+			})
+			continue
+		}
+		for _, spec := range specsToRemove {
+			edits = append(edits, analysis.TextEdit{
+				Pos: spec.Pos(),
+				End: spec.End(),
+			})
+		}
+	}
+	return edits
+}
+
+func importUsedAfterReplacements(
+	pass *analysis.Pass,
+	file *ast.File,
+	pkgName *types.PkgName,
+	replacements []analysis.TextEdit,
+) bool {
+	for ident, obj := range pass.TypesInfo.Uses {
+		if ident.Pos() < file.Pos() || ident.Pos() >= file.End() {
+			continue
+		}
+
+		isReference := obj == pkgName
+
+		if pkgName.Name() == "." {
+			imported := pkgName.Imported()
+			isReference = obj.Pkg() == imported && obj.Parent() == imported.Scope()
+		}
+
+		if !isReference {
+			continue
+		}
+
+		removed := false
+		for _, edit := range replacements {
+			if edit.Pos <= ident.Pos() && ident.End() <= edit.End {
+				removed = true
+				break
+			}
+		}
+		if !removed {
+			return true
+		}
+	}
+	return false
 }

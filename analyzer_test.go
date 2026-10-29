@@ -21,3 +21,7 @@ func TestContainerSuggestedFixes(t *testing.T) {
 func TestAccessorSuggestedFixes(t *testing.T) {
 	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), testctx.Analyzer, "accessors")
 }
+
+func TestRemoveUnusedImport(t *testing.T) {
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), testctx.Analyzer, "unusedimport")
+}
