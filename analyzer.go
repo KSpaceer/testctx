@@ -27,6 +27,8 @@ func run(pass *analysis.Pass) (any, error) {
 	}
 
 	inspectResult := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
+	cleanupFunctions := functionsCalledDuringCleanup(ssaResult)
 
 	astFilter := []ast.Node{(*ast.CallExpr)(nil)}
 
@@ -98,7 +100,7 @@ func run(pass *analysis.Pass) (any, error) {
 
 		// calls of context.Background/context.TODO
 		// are fine within testing.TB.Cleanup because testing.TB.Context is already cancelled
-		if isWithinCleanup(pass, callExpr) {
+		if instr := callToSSA(ssaResult, callExpr); instr != nil && cleanupFunctions[instr.Block().Parent()] {
 			return
 		}
 
@@ -162,17 +164,6 @@ func getTestingTBInterface(pass *analysis.Pass) (*types.Interface, bool) {
 	return nil, false
 }
 
-func isWithinCleanup(pass *analysis.Pass, call *ast.CallExpr) bool {
-	ssaResult := pass.ResultOf[buildssa.Analyzer].(*buildssa.SSA)
-
-	ssaInstr := callToSSA(ssaResult, call)
-	if ssaInstr == nil {
-		return false
-	}
-
-	return isInstructionWithinCleanup(ssaInstr)
-}
-
 func callToSSA(ssaResult *buildssa.SSA, call *ast.CallExpr) ssa.Instruction {
 	pos := call.Pos()
 
@@ -207,102 +198,103 @@ func findDeepestEnclosingFunc(fn *ssa.Function, pos token.Pos) *ssa.Function {
 	return fn
 }
 
-func isInstructionWithinCleanup(instr ssa.Instruction) bool {
-	block := instr.Block()
-	if block == nil {
-		return false
-	}
-	currentFn := block.Parent()
-	if currentFn == nil {
-		return false
+// functionsCalledDuringCleanup follows calls forward from registered callbacks.
+// A function is exempt if any cleanup path reaches it, even if it also has
+// ordinary callers. Merely creating a nested closure does not call it.
+func functionsCalledDuringCleanup(result *buildssa.SSA) map[*ssa.Function]bool {
+	bindings := closureBindings(result)
+	callees := make(map[*ssa.Function][]*ssa.Function)
+	var queue []*ssa.Function
+	for _, fn := range result.SrcFuncs {
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				call, ok := instr.(ssa.CallInstruction)
+				if !ok {
+					continue
+				}
+				common := call.Common()
+				callees[fn] = append(callees[fn], functionTargets(common.Value, bindings)...)
+				if isCleanupCall(common) {
+					callback := common.Args[len(common.Args)-1]
+					queue = append(queue, functionTargets(callback, bindings)...)
+				}
+			}
+		}
 	}
 
-	queue := []*ssa.Function{currentFn}
-	visited := make(map[*ssa.Function]bool)
-	visited[currentFn] = true
-
+	reachable := make(map[*ssa.Function]bool)
 	for len(queue) > 0 {
 		fn := queue[0]
 		queue = queue[1:]
-
-		refs := fn.Referrers()
-		if refs == nil {
+		if reachable[fn] {
 			continue
 		}
-
-		for _, ref := range *refs {
-			if call, ok := ref.(*ssa.Call); ok && isCleanupCall(call, fn) {
-				return true
-			}
-
-			if closure, ok := ref.(*ssa.MakeClosure); ok {
-				closureRefs := closure.Referrers()
-				if closureRefs == nil {
-					continue
-				}
-
-				for _, closureRef := range *closureRefs {
-					if call, ok := closureRef.(*ssa.Call); ok && isCleanupCall(call, closure) {
-						return true
-					}
-
-					if b := closureRef.Block(); b != nil {
-						callerFn := b.Parent()
-						if callerFn != nil && !visited[callerFn] {
-							visited[callerFn] = true
-							queue = append(queue, callerFn)
-						}
-					}
-				}
-				continue
-			}
-
-			if b := ref.Block(); b != nil {
-				callerFn := b.Parent()
-				if callerFn != nil && !visited[callerFn] {
-					visited[callerFn] = true
-					queue = append(queue, callerFn)
-				}
-			}
-		}
+		reachable[fn] = true
+		queue = append(queue, callees[fn]...)
 	}
-
-	return false
+	return reachable
 }
 
-func isCleanupCall(call *ssa.Call, passedValue ssa.Value) bool {
-	common := call.Common()
-	if common == nil {
-		return false
-	}
-	callee := common.Value
-	if callee == nil {
-		return false
-	}
-
-	var isCleanup bool
-	if fn, ok := callee.(*ssa.Function); ok && fn.Object() != nil {
-		obj := fn.Object()
-		if obj.Name() == testingCleanupMethod && obj.Pkg() != nil && obj.Pkg().Path() == testingPackagePath {
-			isCleanup = true
-		}
-	}
-	if !isCleanup && common.Method != nil && common.Method.Name() == testingCleanupMethod {
-		if named, ok := common.Value.Type().(*types.Named); ok {
-			if pkg := named.Obj().Pkg(); pkg != nil && pkg.Path() == testingPackagePath {
-				isCleanup = true
+// closureBindings connects captured variables to their bindings and local
+// storage to its possible values. Stores are combined without regard to order.
+func closureBindings(result *buildssa.SSA) map[ssa.Value][]ssa.Value {
+	bindings := make(map[ssa.Value][]ssa.Value)
+	for _, fn := range result.SrcFuncs {
+		for _, block := range fn.Blocks {
+			for _, instr := range block.Instrs {
+				switch instr := instr.(type) {
+				case *ssa.Store:
+					bindings[instr.Addr] = append(bindings[instr.Addr], instr.Val)
+				case *ssa.MakeClosure:
+					closure := instr.Fn.(*ssa.Function)
+					for i, binding := range instr.Bindings {
+						variable := closure.FreeVars[i]
+						bindings[variable] = append(bindings[variable], binding)
+					}
+				}
 			}
 		}
 	}
+	return bindings
+}
 
-	if !isCleanup {
-		return false
-	}
-
-	for _, arg := range common.Args {
-		if arg == passedValue {
-			return true
+// functionTargets resolves local aliases, captured variables, and branch-selected
+// function values. Parameters and returned functions are unresolved.
+func functionTargets(value ssa.Value, bindings map[ssa.Value][]ssa.Value) []*ssa.Function {
+	var functions []*ssa.Function
+	queue := []ssa.Value{value}
+	visited := make(map[ssa.Value]bool)
+	for len(queue) > 0 {
+		value := queue[0]
+		queue = queue[1:]
+		if visited[value] {
+			continue
+		}
+		visited[value] = true
+		queue = append(queue, bindings[value]...)
+		switch value := value.(type) {
+		case *ssa.Function:
+			functions = append(functions, value)
+		case *ssa.MakeClosure:
+			queue = append(queue, value.Fn)
+		case *ssa.Phi:
+			queue = append(queue, value.Edges...)
+		case *ssa.ChangeType:
+			queue = append(queue, value.X)
+		case *ssa.UnOp:
+			if value.Op == token.MUL {
+				queue = append(queue, value.X)
+			}
 		}
 	}
-	return false
+	return functions
+}
+
+func isCleanupCall(common *ssa.CallCommon) bool {
+	method := common.Method
+	if fn := common.StaticCallee(); fn != nil {
+		method, _ = fn.Object().(*types.Func)
+	}
+	return method != nil && method.Name() == testingCleanupMethod &&
+		method.Pkg() != nil && method.Pkg().Path() == testingPackagePath
 }
