@@ -12,6 +12,7 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
+// Analyzer is the analysis.Analyzer for testctx
 var Analyzer = &analysis.Analyzer{
 	Name:     "testctx",
 	Doc:      "find context.Background()/context.TODO() usages in tests",
