@@ -1,0 +1,11 @@
+package indirectcontainer
+
+import (
+	"containerfixture"
+	"context"
+)
+
+// This package only imports testing transitively through containerfixture.
+func indirect(suite containerfixture.Exported) context.Context {
+	return suite.TB.Context() // want "using context.Background/context.TODO when testing.TB is present"
+}

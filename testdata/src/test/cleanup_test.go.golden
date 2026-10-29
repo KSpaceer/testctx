@@ -1,0 +1,102 @@
+package test_test
+
+import (
+	"context"
+	"testing"
+)
+
+func TestOK_CleanupHelperChain(t *testing.T) {
+	t.Cleanup(func() { cleanupChain(t) })
+}
+
+func cleanupChain(t *testing.T) {
+	cleanupLeaf(t)
+}
+
+func cleanupLeaf(t *testing.T) {
+	t.Log(context.TODO())
+}
+
+func TestOK_CleanupAndOrdinaryCalls(t *testing.T) {
+	f := func() { t.Log(context.Background()) }
+	f()
+	t.Cleanup(f)
+	sharedCleanupHelper(t)
+	t.Cleanup(func() { sharedCleanupHelper(t) })
+}
+
+func sharedCleanupHelper(t *testing.T) {
+	t.Log(context.Background())
+}
+
+func TestOK_RecursiveCleanup(t *testing.T) {
+	t.Cleanup(func() { recursiveCleanup(t, 2) })
+}
+
+func recursiveCleanup(t *testing.T, n int) {
+	if n > 0 {
+		recursiveCleanup(t, n-1)
+	}
+	t.Log(context.TODO())
+}
+
+func TestOK_InterfaceCleanup(t *testing.T) {
+	var tb testing.TB = t
+	tb.Cleanup(func() { interfaceCleanupHelper(t) })
+}
+
+func interfaceCleanupHelper(t *testing.T) {
+	t.Log(context.Background())
+}
+
+func TestOK_BranchSelectedCleanup(t *testing.T) {
+	f := func() { t.Log(context.Background()) }
+	if t.Name() == "alternative" {
+		f = func() { t.Log(context.TODO()) }
+	}
+	t.Cleanup(f)
+}
+
+func TestOK_ClosureCalledFromCleanup(t *testing.T) {
+	f := func() { t.Log(context.Background()) }
+	t.Cleanup(func() { f() })
+}
+
+func TestOrdinaryHelper(t *testing.T) {
+	ordinaryHelper(t)
+}
+
+func TestOutsideCleanupCallback(t *testing.T) {
+	t.Log(t.Context()) // want "using context.Background/context.TODO when testing.TB is present"
+	t.Cleanup(func() { t.Log(context.TODO()) })
+}
+
+type cleanupCallback func()
+
+func TestOK_ConvertedCleanupCallback(t *testing.T) {
+	f := cleanupCallback(func() { t.Log(context.Background()) })
+	t.Cleanup(f)
+}
+
+func ordinaryHelper(t *testing.T) {
+	t.Log(t.Context()) // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func TestUncalledClosureInCleanup(t *testing.T) {
+	t.Cleanup(func() {
+		f := func() {
+			t.Log(t.Context()) // want "using context.Background/context.TODO when testing.TB is present"
+		}
+		_ = f
+	})
+}
+
+type otherCleanup struct{}
+
+func (otherCleanup) Cleanup(f func()) { f() }
+
+func TestUnrelatedCleanup(t *testing.T) {
+	otherCleanup{}.Cleanup(func() {
+		t.Log(t.Context()) // want "using context.Background/context.TODO when testing.TB is present"
+	})
+}

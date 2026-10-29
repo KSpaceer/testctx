@@ -1,0 +1,26 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - errorlint
+    - exhaustive
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - nolintlint
+    - predeclared
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - wastedassign
+  settings:
+    revive:
+      enable-default-rules: true
+      rules:
+        - name: package-comments
+          disabled: true
