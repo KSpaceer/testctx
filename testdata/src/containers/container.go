@@ -1,0 +1,117 @@
+package containers
+
+import (
+	"containerfixture"
+	"context"
+	"testing"
+)
+
+type holder struct {
+	TB testing.TB
+}
+
+type recursive struct {
+	Next *recursive
+	TB   testing.TB
+}
+
+type emptyRecursive struct {
+	Next *emptyRecursive
+}
+
+func direct(t *testing.T) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func namedField(suite holder) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func pointerContainer(suite *holder) context.Context {
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func nestedField(suite struct{ Env *holder }) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func embeddedField(suite struct{ holder }) context.Context {
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func embeddedTB(suite struct{ testing.TB }) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func privateField(suite struct{ tb *testing.T }) context.Context {
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func exportedField(suite containerfixture.Exported) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func recursiveField(suite *recursive) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func preferDirect(suite holder, t *testing.T) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func preferShallow(suite struct {
+	Deep holder
+	TB   testing.TB
+}) context.Context {
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func (suite *holder) receiver() context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func valueField(suite struct{ T testing.T }) context.Context {
+	return context.Background() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func valueVariable(t testing.T) context.Context {
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func shadowed(suite holder) context.Context {
+	{
+		suite := 1
+		_ = suite
+		_ = context.Background()
+	}
+	return context.TODO() // want "using context.Background/context.TODO when testing.TB is present"
+}
+
+func declaredLater() context.Context {
+	ctx := context.Background()
+	var suite holder
+	_ = suite
+	return ctx
+}
+
+func blankVariable(_ testing.TB) context.Context {
+	return context.Background()
+}
+
+func inaccessibleField(suite containerfixture.Private) context.Context {
+	return context.Background()
+}
+
+func recursiveWithoutTB(suite *emptyRecursive) context.Context {
+	return context.TODO()
+}
+
+func unsupportedContainers(suites []holder, byName map[string]holder) context.Context {
+	return context.Background()
+}
+
+func cleanupField(suite holder) {
+	suite.TB.Cleanup(func() {
+		_ = context.Background()
+	})
+}

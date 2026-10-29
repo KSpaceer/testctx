@@ -12,3 +12,12 @@ func TestAnalyzer(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(t, testdata, testctx.Analyzer, "test")
 }
+
+func TestContainerSuggestedFixes(t *testing.T) {
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), testctx.Analyzer,
+		"containers", "indirectcontainer")
+}
+
+func TestAccessorSuggestedFixes(t *testing.T) {
+	analysistest.RunWithSuggestedFixes(t, analysistest.TestData(), testctx.Analyzer, "accessors")
+}

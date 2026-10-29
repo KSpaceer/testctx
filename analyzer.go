@@ -1,7 +1,9 @@
 package testctx
 
 import (
+	"bytes"
 	"go/ast"
+	"go/format"
 	"go/token"
 	"go/types"
 
@@ -66,41 +68,25 @@ func run(pass *analysis.Pass) (any, error) {
 			return
 		}
 
-		var tbVarName string
-	tbVarSearch:
-		for s := innerScope; s != nil; s = s.Parent() {
-			for _, name := range s.Names() {
-				scopeObj := s.Lookup(name)
-
-				variable, ok := scopeObj.(*types.Var)
-				if !ok {
-					continue
-				}
-
-				varType := variable.Type()
-
-				if types.Implements(varType, tbIface) {
-					tbVarName = variable.Name()
-					break tbVarSearch
-				}
-
-				if _, ok := varType.(*types.Pointer); !ok {
-					ptrType := types.NewPointer(varType)
-					if types.Implements(ptrType, tbIface) {
-						tbVarName = variable.Name()
-						break tbVarSearch
-					}
-				}
-			}
-		}
-
-		if tbVarName == "" {
+		testingValue := findTestingValue(pass, callExpr.Pos(), tbIface)
+		if testingValue == nil {
 			return
 		}
 
 		// calls of context.Background/context.TODO
 		// are fine within testing.TB.Cleanup because testing.TB.Context is already cancelled
 		if instr := callToSSA(ssaResult, callExpr); instr != nil && cleanupFunctions[instr.Block().Parent()] {
+			return
+		}
+
+		replacement := &ast.CallExpr{
+			Fun: &ast.SelectorExpr{
+				X:   testingValue,
+				Sel: ast.NewIdent("Context"),
+			},
+		}
+		var fix bytes.Buffer
+		if err := format.Node(&fix, pass.Fset, replacement); err != nil {
 			return
 		}
 
@@ -115,7 +101,7 @@ func run(pass *analysis.Pass) (any, error) {
 						{
 							Pos:     callExpr.Pos(),
 							End:     callExpr.End(),
-							NewText: []byte(tbVarName + ".Context()"),
+							NewText: fix.Bytes(),
 						},
 					},
 				},
@@ -151,17 +137,182 @@ const (
 )
 
 func getTestingTBInterface(pass *analysis.Pass) (*types.Interface, bool) {
-	for _, imp := range pass.Pkg.Imports() {
-		if imp.Path() == testingPackagePath {
-			obj := imp.Scope().Lookup(testingTBInterfaceName)
-			if typeName, ok := obj.(*types.TypeName); ok {
-				if iface, ok := typeName.Type().Underlying().(*types.Interface); ok {
-					return iface, true
-				}
-			}
+	queue := []*types.Package{pass.Pkg}
+	visited := make(map[*types.Package]bool)
+
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		if visited[pkg] {
+			continue
 		}
+		visited[pkg] = true
+
+		if pkg.Path() == testingPackagePath {
+			obj := pkg.Scope().Lookup(testingTBInterfaceName)
+			if obj == nil {
+				return nil, false
+			}
+			iface, ok := obj.Type().Underlying().(*types.Interface)
+			return iface, ok
+		}
+		queue = append(queue, pkg.Imports()...)
 	}
 	return nil, false
+}
+
+type testingCandidate struct {
+	expr        ast.Expr
+	typ         types.Type
+	addressable bool
+}
+
+func findTestingValue(pass *analysis.Pass, pos token.Pos, tbIface *types.Interface) ast.Expr {
+	scope := pass.Pkg.Scope().Innermost(pos)
+	if scope == nil {
+		return nil
+	}
+
+	var queue []testingCandidate
+	names := make(map[string]bool)
+	for s := scope; s != nil; s = s.Parent() {
+		for _, name := range s.Names() {
+			if names[name] {
+				continue
+			}
+			names[name] = true
+
+			_, obj := s.LookupParent(name, pos)
+			variable, ok := obj.(*types.Var)
+			if !ok {
+				continue
+			}
+			queue = append(queue, testingCandidate{
+				expr:        ast.NewIdent(name),
+				typ:         variable.Type(),
+				addressable: true,
+			})
+		}
+	}
+
+	type visitKey struct {
+		typ         types.Type
+		addressable bool
+	}
+	visited := make(map[visitKey]bool)
+	var accessor ast.Expr
+
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+
+		key := visitKey{
+			typ:         types.Unalias(curr.typ),
+			addressable: curr.addressable,
+		}
+		if visited[key] {
+			continue
+		}
+		visited[key] = true
+
+		if implementsTestingTB(curr.typ, curr.addressable, tbIface) {
+			return curr.expr
+		}
+
+		if accessor == nil {
+			accessor = maybeTestingAccessor(pass.Pkg, curr, tbIface)
+		}
+
+		underlying := curr.typ.Underlying()
+		addressable := curr.addressable
+		if pointer, ok := underlying.(*types.Pointer); ok {
+			underlying = pointer.Elem().Underlying()
+			addressable = true
+		}
+
+		structure, ok := underlying.(*types.Struct)
+		if !ok {
+			continue
+		}
+
+		for i := 0; i < structure.NumFields(); i++ {
+			field := structure.Field(i)
+			if !field.Exported() && field.Pkg() != pass.Pkg {
+				continue
+			}
+
+			obj, _, _ := types.LookupFieldOrMethod(curr.typ, curr.addressable, pass.Pkg, field.Name())
+			if obj != field {
+				continue
+			}
+
+			queue = append(queue, testingCandidate{
+				expr: &ast.SelectorExpr{
+					X:   curr.expr,
+					Sel: ast.NewIdent(field.Name()),
+				},
+				typ:         field.Type(),
+				addressable: addressable,
+			})
+		}
+	}
+	return accessor
+}
+
+func implementsTestingTB(typ types.Type, addressable bool, tbIface *types.Interface) bool {
+	if types.Implements(typ, tbIface) {
+		return true
+	}
+	if !addressable {
+		return false
+	}
+	return types.Implements(types.NewPointer(typ), tbIface)
+}
+
+type testingAccessor struct {
+	method         string
+	signatureCheck func(signature *types.Signature, tbIface *types.Interface) bool
+	exprBuilder    func(methodCarrier ast.Expr) ast.Expr
+}
+
+var testingAccessors = [...]testingAccessor{
+	// testify suite testing accessor
+	{
+		method: "T",
+		signatureCheck: func(signature *types.Signature, tbIface *types.Interface) bool {
+			if signature.Params().Len() != 0 || signature.Results().Len() != 1 {
+				return false
+			}
+			result := signature.Results().At(0).Type()
+			return implementsTestingTB(result, false, tbIface)
+		},
+		exprBuilder: func(methodCarrier ast.Expr) ast.Expr {
+			return &ast.CallExpr{
+				Fun: &ast.SelectorExpr{
+					X:   methodCarrier,
+					Sel: ast.NewIdent("T"),
+				},
+			}
+		},
+	},
+}
+
+func maybeTestingAccessor(pkg *types.Package, candidate testingCandidate, tbIface *types.Interface) ast.Expr {
+	for i := range testingAccessors {
+		obj, _, _ := types.LookupFieldOrMethod(candidate.typ, candidate.addressable, pkg, testingAccessors[i].method)
+		method, ok := obj.(*types.Func)
+		if !ok {
+			continue
+		}
+
+		signature := method.Type().(*types.Signature)
+		if !testingAccessors[i].signatureCheck(signature, tbIface) {
+			continue
+		}
+
+		return testingAccessors[i].exprBuilder(candidate.expr)
+	}
+	return nil
 }
 
 func callToSSA(ssaResult *buildssa.SSA, call *ast.CallExpr) ssa.Instruction {
